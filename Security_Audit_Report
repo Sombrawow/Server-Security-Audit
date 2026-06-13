@@ -1,0 +1,834 @@
+# Security Audit Report — shadowserver
+
+**System:** shadowserver (Intel NUC, Ubuntu 24.04.4 LTS)
+**Purpose:** Automated 24/7 trading server (MetaTrader 5 / XAUUSD)
+**Audit date:** 2026-06-12
+**Auditor:** Javi (self-audit, portfolio documentation)
+**Methodology:** Manual audit — enumeration, configuration review, surface analysis
+**Scope:** Host-level security (network exposure, access control, services, firewall, credentials, scheduled tasks)
+**Out of scope:** Application-layer testing of MT5/Wine internals, physical security
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [System Overview](#2-system-overview)
+3. [Findings Summary](#3-findings-summary)
+4. [Detailed Findings](#4-detailed-findings)
+   - [CRIT-01 — WireGuard private key exposed in SaveConfig](#crit-01)
+   - [CRIT-02 — SSH open to the world (0.0.0.0:22)](#crit-02)
+   - [HIGH-01 — RDP (3389/tcp) accessible from LAN without VPN enforcement](#high-01)
+   - [HIGH-02 — Apache2 + HTTP/HTTPS (80/443) running with no apparent purpose](#high-02)
+   - [HIGH-03 — MariaDB listening on localhost with no documented purpose](#high-03)
+   - [HIGH-04 — Postfix MTA exposed on localhost — unnecessary attack surface](#high-04)
+   - [MED-01 — Samba (139/445) bound to all interfaces](#med-01)
+   - [MED-02 — Avahi/mDNS broadcasting service on all interfaces](#med-02)
+   - [MED-03 — Duplicated and conflicting crontab entries](#med-03)
+   - [MED-04 — UFW rules contain redundant and conflicting entries](#med-04)
+   - [MED-05 — X11Forwarding enabled in sshd_config](#med-05)
+   - [MED-06 — Second WireGuard peer (10.8.0.3) with external endpoint undocumented](#med-06)
+   - [LOW-01 — CUPS and cups-browsed running without print function](#low-01)
+   - [LOW-02 — pkexec SUID binary present (CVE-2021-4034 vector class)](#low-02)
+   - [LOW-03 — UFW logging set to LOW](#low-03)
+   - [LOW-04 — Nextcloud backup cron references service not found in running services](#low-04)
+5. [Positive Security Controls](#5-positive-security-controls)
+6. [Remediation Roadmap](#6-remediation-roadmap)
+7. [Appendix — Raw Enumeration Data](#7-appendix)
+
+---
+
+## 1. Executive Summary
+
+The shadowserver trading system presents a **mixed security posture**. Several solid controls are already in place — WireGuard VPN for remote access, UFW with default-deny inbound, fail2ban on SSH and RDP, ClamAV, and a fully patched OS (0 pending upgrades). These represent meaningful baseline hardening.
+
+However, the audit identified **2 critical findings**, **5 high-severity findings**, and **6 additional findings** (medium/low) that materially increase the attack surface of a system that handles live financial operations 24/7.
+
+The most serious issues are: SSH listening on all interfaces instead of being restricted to the WireGuard tunnel, and the WireGuard private key being written in plaintext to the `wg0.conf` file by the `SaveConfig = true` directive. Additional concerns include Apache2 and MariaDB running with no documented operational purpose, Postfix exposed as an MTA, and several redundant/conflicting firewall and cron rules that indicate configuration drift.
+
+**Risk profile without remediation:** A successful brute-force or credential stuffing attack against the globally-exposed SSH port would give an attacker direct shell access to a machine running a live XAUUSD trading bot with financial account credentials in memory.
+
+---
+
+## 2. System Overview
+
+| Parameter | Value |
+|-----------|-------|
+| Hostname | shadowserver |
+| OS | Ubuntu 24.04.4 LTS (kernel 6.8.0-124-generic) |
+| Architecture | x86_64 |
+| Primary interface | eno1 — 192.168.0.16/24 (LAN, dynamic DHCP) |
+| VPN interface | wg0 — 10.8.0.1/24 (WireGuard server) |
+| WireGuard peers | 10.8.0.2/32 (LAN client, 192.168.0.32) · 10.8.0.3/32 (external, 84.125.103.70) |
+| Uptime context | Rebooted 2026-06-12 18:08; previous sessions indicate regular weekly reboots |
+| Trading process | terminal64.exe under Wine 9.0 (WINEPREFIX /home/sombra\_0/.mt5wine) |
+| Display stack | Xvfb :20 → x11vnc :5900/:5901 (localhost only) → xrdp :3389 |
+| Pending OS updates | **0** (fully patched) |
+| Open listening ports | 22, 25, 80, 139, 443, 445, 631, 3306, 3350, 3389, 5900, 5901 |
+
+---
+
+## 3. Findings Summary
+
+| ID | Severity | Title | Status |
+|----|----------|-------|--------|
+| CRIT-01 | 🔴 CRITICAL | WireGuard private key written to disk via SaveConfig | Open |
+| CRIT-02 | 🔴 CRITICAL | SSH listening on 0.0.0.0:22 (all interfaces) | Open |
+| HIGH-01 | 🟠 HIGH | RDP (3389) reachable from full LAN without VPN enforcement | Open |
+| HIGH-02 | 🟠 HIGH | Apache2 running on 80/443 with no documented purpose | Open |
+| HIGH-03 | 🟠 HIGH | MariaDB running on localhost with no documented purpose | Open |
+| HIGH-04 | 🟠 HIGH | Postfix MTA active with no operational justification | Open |
+| MED-01 | 🟡 MEDIUM | Samba bound to all interfaces (not restricted to wg0/LAN) | Open |
+| MED-02 | 🟡 MEDIUM | Avahi/mDNS broadcasting on all interfaces | Open |
+| MED-03 | 🟡 MEDIUM | Crontab contains duplicated and conflicting entries | Open |
+| MED-04 | 🟡 MEDIUM | UFW ruleset contains redundant and conflicting rules | Open |
+| MED-05 | 🟡 MEDIUM | X11Forwarding enabled in sshd_config | Open |
+| MED-06 | 🟡 MEDIUM | WireGuard peer 10.8.0.3 (external IP) undocumented | Open |
+| LOW-01 | 🔵 LOW | CUPS and cups-browsed running without print function | Open |
+| LOW-02 | 🔵 LOW | pkexec SUID present (privilege escalation vector class) | Open |
+| LOW-03 | 🔵 LOW | UFW logging level set to LOW | Open |
+| LOW-04 | 🔵 LOW | Nextcloud backup cron with no Nextcloud service running | Open |
+
+---
+
+## 4. Detailed Findings
+
+---
+
+### CRIT-01
+
+**Severity:** 🔴 CRITICAL
+**Title:** WireGuard private key written to disk in plaintext via `SaveConfig = true`
+
+**Description:**
+The `wg0.conf` file contains `SaveConfig = true`. This directive causes `wg-quick` to overwrite the configuration file on interface shutdown, including the interface's `PrivateKey` in plaintext. The private key was confirmed present in `/etc/wireguard/wg0.conf` during enumeration.
+
+**Evidence:**
+```
+[Interface]
+Address = 10.8.0.1/24
+SaveConfig = true          # <-- triggers key persistence
+...
+PrivateKey = [REDACTED]    # written to disk in plaintext
+```
+
+**Impact:**
+If an attacker gains read access to `/etc/wireguard/wg0.conf` (readable by root; however, local privilege escalation or misconfigured sudo could expose it), they can extract the server's private key and impersonate the VPN server. This breaks the entire WireGuard trust model. Additionally, `SaveConfig = true` has a known side effect: any runtime `wg set` changes (added peers, changed endpoints) get persisted back to disk, potentially overwriting intentional static configuration.
+
+**Remediation:**
+```bash
+# 1. Remove SaveConfig from wg0.conf
+sudo wg-quick down wg0
+sudo nano /etc/wireguard/wg0.conf
+# Remove or set: SaveConfig = false
+
+# 2. Store the private key via a separate secret file (not inline)
+#    Generate a separate key file readable only by root:
+sudo wg genkey | sudo tee /etc/wireguard/server_private.key | sudo wg pubkey > /etc/wireguard/server_public.key
+sudo chmod 600 /etc/wireguard/server_private.key
+
+# 3. Reference it by path in wg0.conf:
+# PrivateKey = /etc/wireguard/server_private.key  (wg-quick supports file paths)
+
+# 4. Bring interface back up
+sudo wg-quick up wg0
+```
+
+> **Note:** After rotating the key, all peers must be updated with the new server public key and re-connect.
+
+**References:** WireGuard documentation — `SaveConfig` behavior; CIS Benchmark for Linux — credential storage
+
+---
+
+### CRIT-02
+
+**Severity:** 🔴 CRITICAL
+**Title:** SSH daemon listening on `0.0.0.0:22` and `[::]:22` (all interfaces, globally reachable)
+
+**Description:**
+The SSH daemon binds to all interfaces without restriction. This means port 22 is reachable from the LAN (192.168.0.0/24) directly, from the WireGuard tunnel (10.8.0.0/24), and — depending on router NAT configuration — potentially from the internet. UFW has the following rules for SSH:
+
+```
+22                         ALLOW IN    192.168.0.0/24
+22/tcp                     ALLOW IN    Anywhere          # <-- allows all IPv4
+22 (v6)                    ALLOW IN    Anywhere (v6)     # <-- allows all IPv6
+22 on wg0                  ALLOW IN    Anywhere
+2222/tcp                   ALLOW IN    Anywhere          # <-- non-standard port, also open
+2222/tcp (v6)              ALLOW IN    Anywhere (v6)
+```
+
+The `22/tcp ALLOW IN Anywhere` rule negates the VPN-restriction intent. The `2222/tcp` open rule is particularly notable — there is no service listening on 2222 in the `ss` output, suggesting this is a leftover rule from a previous configuration.
+
+**Evidence:**
+```
+# ss -tlnp output
+LISTEN    0    128    0.0.0.0:22    0.0.0.0:*
+LISTEN    0    128       [::]:22       [::]:*
+```
+
+**Impact:**
+SSH is the highest-value target on this machine. Even with fail2ban active, a globally exposed SSH port means continuous automated brute-force and credential-stuffing attempts. The `lastb` output shows 0 failed attempts — this is because the server appears to be behind NAT with no port forwarding currently. However, this is a router configuration dependency, not a server-level control. If the router config changes or the ISP assigns a routable IP, SSH becomes immediately exposed.
+
+**Remediation:**
+```bash
+# 1. Restrict SSH to WireGuard interface only in sshd_config
+sudo nano /etc/ssh/sshd_config
+# Add:
+ListenAddress 10.8.0.1
+ListenAddress 192.168.0.16
+# This restricts SSH to wg0 and LAN interface only
+
+# 2. Clean up UFW rules
+sudo ufw delete allow 22/tcp             # removes the "Anywhere" rule
+sudo ufw delete allow 2222/tcp           # remove unused port
+sudo ufw allow in on wg0 to any port 22 proto tcp
+sudo ufw allow from 192.168.0.0/24 to any port 22 proto tcp
+
+# 3. Restart SSH
+sudo systemctl restart ssh
+
+# 4. Verify (from a separate session before closing current one)
+ss -tlnp | grep :22
+```
+
+> ⚠️ **Always maintain an active session before restarting SSH. Test from a new connection before closing the current one.**
+
+---
+
+### HIGH-01
+
+**Severity:** 🟠 HIGH
+**Title:** RDP (3389/tcp) accessible from LAN subnet without VPN enforcement
+
+**Description:**
+xrdp listens on `*:3389` (all interfaces). UFW allows 3389/tcp from `192.168.0.0` (single host, not subnet notation — this is likely a misconfiguration; `192.168.0.0` is the network address, not a valid host). The intent appears to be LAN-only RDP access, but the binding to all interfaces and imprecise firewall rule reduce confidence in the actual enforcement.
+
+**Evidence:**
+```
+# UFW rule
+3389/tcp    ALLOW IN    192.168.0.0    # network address, not a host
+
+# ss output
+LISTEN    0    2    *:3389    *:*
+```
+
+**Impact:**
+RDP is a high-value attack surface. The xrdp daemon version and session manager are exposed. If the firewall rule is misinterpreted or a rule ordering issue allows a bypass, RDP would be accessible from within the LAN to any machine, not just the intended client. Additionally, the rule `192.168.0.0` (without /24) may behave differently from `192.168.0.0/24` in UFW depending on version — it should be explicit.
+
+**Remediation:**
+```bash
+# 1. Restrict xrdp to listen only on wg0 and LAN interface
+# xrdp does not have a native ListenAddress config equivalent to sshd
+# The correct approach is UFW enforcement + optional binding via xrdp.ini
+
+# 2. Fix the UFW rule (replace imprecise entry)
+sudo ufw delete allow from 192.168.0.0 to any port 3389 proto tcp
+sudo ufw allow in on wg0 to any port 3389 proto tcp
+# If LAN RDP (without VPN) is also needed:
+sudo ufw allow from 192.168.0.0/24 to any port 3389 proto tcp
+
+# 3. Ensure fail2ban xrdp jail is active (already confirmed running)
+sudo fail2ban-client status xrdp
+```
+
+**Recommended posture:** Require VPN (wg0) for all RDP access. This eliminates LAN-direct RDP and centralizes all remote access through WireGuard.
+
+---
+
+### HIGH-02
+
+**Severity:** 🟠 HIGH
+**Title:** Apache2 running on ports 80 and 443 with no documented operational purpose
+
+**Description:**
+Apache2 is active and listening on `*:80` and `*:443`. There is also a `certbot` cron entry and a `certbot.timer` active in systemd, indicating TLS certificates are being maintained. The running services also include a `check-nextcloud.timer` and a `nextcloud-backup.sh` cron entry. This suggests Nextcloud may have been installed at some point but is not confirmed running as a service.
+
+**Evidence:**
+```
+apache2.service   loaded active running   The Apache HTTP Server
+# ss output
+LISTEN    0    511    *:80     *:*
+LISTEN    0    511    *:443    *:*
+# timers
+certbot.timer — active
+check-nextcloud.timer — active
+```
+
+**Impact:**
+An Apache2 instance with no maintained application is a significant attack surface. Default configurations, unpatched modules, or leftover web applications (Nextcloud, phpMyAdmin, etc.) are common vectors for initial access. Port 80/443 are the most commonly scanned ports on the internet. If the server has any form of public reachability (direct IP or through a DDNS entry like `ipshadow.ddns.net`), this is externally exposed.
+
+**Remediation — Option A (Nextcloud is still needed):**
+```bash
+# Verify what's actually served
+sudo apache2ctl -S
+ls /etc/apache2/sites-enabled/
+curl -sk https://localhost/ | head -20
+
+# If Nextcloud is operational, ensure:
+# - It is updated to latest version
+# - Access is restricted to VPN/LAN via Apache config or UFW
+# - UFW blocks 80/443 from internet (only allow from 10.8.0.0/24 or 192.168.0.0/24)
+sudo ufw allow from 10.8.0.0/24 to any port 443 proto tcp
+sudo ufw allow from 192.168.0.0/24 to any port 443 proto tcp
+```
+
+**Remediation — Option B (Apache/Nextcloud not needed):**
+```bash
+sudo systemctl stop apache2
+sudo systemctl disable apache2
+sudo systemctl stop certbot.timer
+sudo systemctl disable certbot.timer
+# Review and disable check-nextcloud.timer
+sudo systemctl stop check-nextcloud.timer
+sudo systemctl disable check-nextcloud.timer
+```
+
+---
+
+### HIGH-03
+
+**Severity:** 🟠 HIGH
+**Title:** MariaDB listening on `127.0.0.1:3306` with no confirmed operational purpose
+
+**Description:**
+MariaDB is running and accepting connections on localhost port 3306. No application currently running on the server has been confirmed to use this database, unless Nextcloud (see HIGH-02) is still operational.
+
+**Evidence:**
+```
+mariadb.service   loaded active running   MariaDB 10.11.14 database server
+# ss output
+LISTEN    0    80    127.0.0.1:3306    0.0.0.0:*
+```
+
+**Impact:**
+The binding to `127.0.0.1` prevents direct external access, which is correct. However, an attacker who achieves local code execution (e.g., through a web application vulnerability in Apache, or through the MT5/Wine stack) would have immediate access to a MariaDB instance. If the database contains Nextcloud user credentials, financial configuration data, or API keys, the impact is significant. Additionally, a misconfiguration (e.g., a future change to `bind-address = 0.0.0.0`) could expose it externally.
+
+**Remediation:**
+```bash
+# If MariaDB is not needed:
+sudo systemctl stop mariadb
+sudo systemctl disable mariadb
+
+# If needed (Nextcloud backend):
+# Verify the root password is not empty
+sudo mysql -u root -p
+# Inside MariaDB:
+SELECT user, host, authentication_string FROM mysql.user;
+# Ensure no anonymous users exist
+DELETE FROM mysql.user WHERE user='';
+FLUSH PRIVILEGES;
+
+# Harden MariaDB configuration
+sudo mysql_secure_installation
+```
+
+---
+
+### HIGH-04
+
+**Severity:** 🟠 HIGH
+**Title:** Postfix MTA active and listening on `127.0.0.1:25` and `[::1]:25`
+
+**Description:**
+Postfix is running as a mail transfer agent. It listens only on localhost, which reduces direct external exposure. However, there is no operational reason for a trading server to run an MTA. Postfix is commonly installed as a dependency by other packages and left running by default.
+
+**Evidence:**
+```
+postfix@-.service   loaded active running   Postfix Mail Transport Agent
+# ss output
+LISTEN    0    100    127.0.0.1:25    0.0.0.0:*
+LISTEN    0    100        [::1]:25       [::]:*
+```
+
+**Impact:**
+A local MTA creates a mail relay pathway. Processes running on the machine (including scripts, cron jobs, or compromised applications) can send email through it. In a compromise scenario, Postfix could be used for data exfiltration or to send spam/phishing from the machine's IP. The crontab entries reference scripts whose output is sent via email by default in cron — if Postfix is the relay, monitoring output from those scripts requires it, but this should be an explicit decision.
+
+**Remediation:**
+```bash
+# If no scripts depend on local mail delivery:
+sudo systemctl stop postfix
+sudo systemctl disable postfix
+
+# If cron output mailing is desired, redirect to a file instead:
+# In crontab, add MAILTO="" at the top to suppress all email
+# and redirect output explicitly: command >> /var/log/script.log 2>&1
+```
+
+---
+
+### MED-01
+
+**Severity:** 🟡 MEDIUM
+**Title:** Samba (ports 139/445) and Winbind bound to all interfaces
+
+**Description:**
+Samba's `smbd`, `nmbd`, and `winbind` services are running and listening on all interfaces. The intended use is the MT5Scripts share (MQL5/Scripts/ directory). There is no firewall rule explicitly allowing Samba, which means UFW's `Anywhere ALLOW IN from 10.8.0.0/24` rule (which allows all traffic from the WireGuard subnet) covers it implicitly.
+
+**Evidence:**
+```
+nmbd.service    loaded active running   Samba NMB Daemon
+smbd.service    loaded active running   Samba SMB Daemon
+winbind.service loaded active running   Samba Winbind Daemon
+# ss output
+LISTEN    0    50    0.0.0.0:139    0.0.0.0:*
+LISTEN    0    50    0.0.0.0:445    0.0.0.0:*
+```
+
+**Impact:**
+Samba on all interfaces means the share is reachable from anywhere UFW permits. The Winbind service adds unnecessary complexity — it is used for Active Directory integration, which is not relevant in this environment. SMB (445) is a historically critical attack surface (EternalBlue/MS17-010 exploited this protocol).
+
+**Remediation:**
+```bash
+# 1. Restrict Samba to specific interfaces in /etc/samba/smb.conf
+sudo nano /etc/samba/smb.conf
+# In [global] section, add:
+interfaces = lo wg0 eno1
+bind interfaces only = yes
+
+# 2. Disable Winbind if not needed for AD integration
+sudo systemctl stop winbind
+sudo systemctl disable winbind
+
+# 3. Restart Samba
+sudo systemctl restart smbd nmbd
+```
+
+---
+
+### MED-02
+
+**Severity:** 🟡 MEDIUM
+**Title:** Avahi/mDNS daemon broadcasting service information on all interfaces
+
+**Description:**
+`avahi-daemon` is running and broadcasting mDNS (multicast DNS) service discovery on all interfaces, including `eno1`. This causes the server to advertise its services (hostname, running services) on the LAN via UDP port 5353.
+
+**Evidence:**
+```
+avahi-daemon.service   loaded active running   Avahi mDNS/DNS-SD Stack
+# ss output
+UNCONN    0    0    0.0.0.0:5353    0.0.0.0:*
+UNCONN    0    0       [::]:5353       [::]:*
+```
+
+**Impact:**
+Avahi broadcasts the server's hostname and services to anyone on the LAN, facilitating network reconnaissance. A LAN attacker can discover `shadowserver` and its running services without active scanning. For a server that should operate silently, this is unnecessary information disclosure.
+
+**Remediation:**
+```bash
+sudo systemctl stop avahi-daemon
+sudo systemctl disable avahi-daemon
+# If other services depend on avahi and break, restrict it instead:
+# In /etc/avahi/avahi-daemon.conf:
+# deny-interfaces=eno1
+```
+
+---
+
+### MED-03
+
+**Severity:** 🟡 MEDIUM
+**Title:** Crontab contains duplicated and conflicting entries
+
+**Description:**
+The root crontab (`sudo crontab -l`) contains two sets of entries for the same scripts, with different schedules. This appears to be the result of a previous configuration not being cleaned up after modification. Additionally, the user crontab contains two separate `@reboot` entries for `terminal64.exe` — one launching without a display variable and one with `DISPLAY=:20` — which will cause two MT5 instances to attempt to start on reboot.
+
+**Evidence:**
+```cron
+# ROOT CRONTAB — duplicated entries (examples):
+0 2 * * *   /usr/local/bin/system-maintenance.sh   # original: daily
+0 2 * * 6   /usr/local/bin/system-maintenance.sh   # modified: Saturdays only
+# Both are present — the daily one was never removed
+
+0 1 * * 1   /usr/local/bin/safe-update.sh          # original: Mondays
+0 4 * * 6   /usr/local/bin/safe-update.sh          # modified: Saturdays
+
+# USER CRONTAB — duplicate MT5 launch:
+@reboot sleep 15 && WINEPREFIX=... wine ".../terminal64.exe" > /dev/null 2>&1 &
+@reboot sleep 30 && DISPLAY=:20 WINEPREFIX=... wine ".../terminal64.exe" >> /var/log/mt5_reboot.log 2>&1 &
+```
+
+**Impact:**
+Duplicate cron entries cause scripts to run twice at different times, potentially causing conflicts in system maintenance operations. The double MT5 `@reboot` entry will launch two Wine/MT5 instances — the first without a valid `DISPLAY` variable will likely fail silently (output goes to `/dev/null`), but the process will consume resources and may interfere with the correct instance.
+
+**Remediation:**
+```bash
+# Edit root crontab — keep only the Saturday-modified versions:
+sudo crontab -e
+# Remove:
+# 0 2 * * *  /usr/local/bin/system-maintenance.sh  (keep the Saturday version)
+# 0 3 * * 0  /usr/local/bin/nextcloud-backup.sh    (keep only one)
+# 0 * * * *  /usr/local/bin/system-monitor.sh      (keep only one)
+# 0 4 * * *  /usr/local/bin/security-check.sh      (keep only one)
+# 0 1 * * 1  /usr/local/bin/safe-update.sh         (keep the Saturday version)
+
+# Edit user crontab — keep only the correct MT5 entry:
+crontab -e
+# Remove the first @reboot entry (no DISPLAY, output to /dev/null)
+# Keep: @reboot sleep 30 && DISPLAY=:20 WINEPREFIX=... >> /var/log/mt5_reboot.log 2>&1 &
+```
+
+---
+
+### MED-04
+
+**Severity:** 🟡 MEDIUM
+**Title:** UFW ruleset contains redundant, conflicting, and imprecise entries
+
+**Description:**
+The UFW ruleset has accumulated rules that conflict with the intended security model. Key issues:
+
+1. `22/tcp ALLOW IN Anywhere` — overrides the intent to restrict SSH to VPN/LAN
+2. `2222/tcp ALLOW IN Anywhere` — no service is listening on 2222; orphaned rule
+3. `3389/tcp ALLOW IN 192.168.0.0` — uses network address instead of `/24` subnet notation
+4. `Anywhere ALLOW IN 10.8.0.0/24` — allows ALL traffic from WireGuard peers, including to Samba, MariaDB-adjacent ports, etc. This is a broad allow that should be reviewed per-service.
+
+**Evidence:**
+```
+# UFW status output (abbreviated):
+22/tcp           ALLOW IN    Anywhere
+2222/tcp         ALLOW IN    Anywhere
+3389/tcp         ALLOW IN    192.168.0.0     # should be 192.168.0.0/24
+Anywhere         ALLOW IN    10.8.0.0/24    # too broad
+```
+
+**Remediation:**
+```bash
+# Full UFW cleanup — recommended rule set:
+sudo ufw --force reset
+
+# Core rules
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw default deny routed
+
+# WireGuard port (must be first — required to establish VPN)
+sudo ufw allow 51820/udp
+
+# SSH: WireGuard tunnel only + LAN
+sudo ufw allow in on wg0 to any port 22 proto tcp
+sudo ufw allow from 192.168.0.0/24 to any port 22 proto tcp
+
+# RDP: WireGuard tunnel only
+sudo ufw allow in on wg0 to any port 3389 proto tcp
+
+# Samba: WireGuard tunnel + LAN only
+sudo ufw allow in on wg0 to any port 445 proto tcp
+sudo ufw allow from 192.168.0.0/24 to any port 445 proto tcp
+
+# HTTP/HTTPS (only if Apache/Nextcloud is intentionally running):
+# sudo ufw allow in on wg0 to any port 443 proto tcp
+# sudo ufw allow from 192.168.0.0/24 to any port 443 proto tcp
+
+sudo ufw enable
+sudo ufw status verbose
+```
+
+> ⚠️ Always verify SSH access from a second terminal before closing the current session after UFW changes.
+
+---
+
+### MED-05
+
+**Severity:** 🟡 MEDIUM
+**Title:** `X11Forwarding yes` enabled in sshd_config
+
+**Description:**
+X11 forwarding is enabled in the SSH daemon configuration. This allows SSH clients to forward X11 sessions through the encrypted tunnel.
+
+**Evidence:**
+```
+# /etc/ssh/sshd_config (filtered)
+X11Forwarding yes
+```
+
+**Impact:**
+X11 forwarding has a known security implication: a malicious server (or compromised server) can capture keystrokes and screen content from the connecting client. In this setup, the primary risk is if sombra\_0 connects to another system using X11 forwarding from within shadowserver. The secondary risk is unnecessary exposure of X11 socket interfaces. For a headless trading server accessed via RDP (which has its own display stack), X11 forwarding over SSH provides no operational benefit.
+
+**Remediation:**
+```bash
+sudo nano /etc/ssh/sshd_config
+# Change:
+X11Forwarding yes
+# To:
+X11Forwarding no
+
+sudo systemctl restart ssh
+```
+
+---
+
+### MED-06
+
+**Severity:** 🟡 MEDIUM
+**Title:** WireGuard peer 10.8.0.3 with external endpoint `84.125.103.70` is undocumented
+
+**Description:**
+The WireGuard configuration shows two peers. The first (10.8.0.2, endpoint 192.168.0.32) matches the expected LAN client. The second peer (10.8.0.3, endpoint `84.125.103.70:62694`) has an external IP address and is currently not performing a handshake (no "latest handshake" shown for this peer in `wg show` output).
+
+**Evidence:**
+```
+peer: UmazW23lndpGQkN5C3YjbKOlP1KwtUcicWFNjDlbRAs=
+  endpoint: 84.125.103.70:62694
+  allowed ips: 10.8.0.3/32
+  # No latest handshake — peer has not connected recently
+```
+
+**Impact:**
+If this peer is an intentional secondary device (e.g., a mobile phone), it represents an additional point of entry into the VPN. If it is a forgotten or unintentional peer, it is an unauthorized configuration entry. An attacker who compromises the corresponding private key (on the device at 84.125.103.70) would have VPN access to the server.
+
+**Remediation:**
+```bash
+# Verify if this peer is intentional
+# If not needed, remove it:
+sudo wg set wg0 peer UmazW23lndpGQkN5C3YjbKOlP1KwtUcicWFNjDlbRAs= remove
+
+# Document the peer in a comment if it is intentional
+# (wg0.conf does not support comments in the [Peer] block natively,
+#  document it in a separate README or inline before the section)
+```
+
+---
+
+### LOW-01
+
+**Severity:** 🔵 LOW
+**Title:** CUPS and `cups-browsed` running without print functionality
+
+**Description:**
+CUPS (Common Unix Printing System) and `cups-browsed` are active. CUPS listens on `127.0.0.1:631`.
+
+**Evidence:**
+```
+cups.service          loaded active running   CUPS Scheduler
+cups-browsed.service  loaded active running   Make remote CUPS printers available locally
+LISTEN    0    4096    127.0.0.1:631    0.0.0.0:*
+```
+
+**Impact:**
+Low direct impact due to localhost binding. However, CUPS has a history of critical vulnerabilities (CVE-2024-47176 — remote code execution via cups-browsed, disclosed 2024). Running unnecessary services increases the attack surface even on localhost.
+
+**Remediation:**
+```bash
+sudo systemctl stop cups cups-browsed
+sudo systemctl disable cups cups-browsed
+sudo systemctl mask cups cups-browsed
+```
+
+---
+
+### LOW-02
+
+**Severity:** 🔵 LOW
+**Title:** `pkexec` SUID binary present on system
+
+**Description:**
+`/usr/bin/pkexec` is present with the SUID bit set. This binary was the subject of CVE-2021-4034 (PwnKit), a local privilege escalation vulnerability in Polkit that was exploitable on virtually all Linux distributions.
+
+**Evidence:**
+```
+/usr/bin/pkexec   # SUID bit confirmed
+```
+
+**Impact:**
+Ubuntu 24.04 ships with a patched version of pkexec (CVE-2021-4034 was patched in polkit 0.105-33). The OS is fully updated (0 pending upgrades), so the known exploit is not applicable. However, pkexec remains a privileged binary. Future undisclosed vulnerabilities in this class of binary represent residual risk.
+
+**Remediation:**
+```bash
+# Option A: Remove SUID bit (lowest impact — may break PolicyKit-dependent GUI apps)
+sudo chmod u-s /usr/bin/pkexec
+
+# Option B: Accept risk given patched OS (document as accepted risk)
+# Since this is a server with no regular GUI user interaction,
+# Option A is appropriate.
+```
+
+---
+
+### LOW-03
+
+**Severity:** 🔵 LOW
+**Title:** UFW logging set to LOW
+
+**Description:**
+UFW logging is active but set to `low`, which logs only blocked packets matching the default policy, not blocked packets from custom rules or allowed connections.
+
+**Evidence:**
+```
+Logging: on (low)
+```
+
+**Impact:**
+Insufficient visibility into network activity. A SOC-oriented server should log at `medium` or higher to capture blocked connection attempts, which are valuable for threat detection and the security audit trail.
+
+**Remediation:**
+```bash
+sudo ufw logging medium
+# Or for maximum visibility:
+sudo ufw logging high
+# Note: high generates significant volume on active systems; medium is the practical choice
+```
+
+---
+
+### LOW-04
+
+**Severity:** 🔵 LOW
+**Title:** Nextcloud backup cron entry and timer present with no confirmed Nextcloud service
+
+**Description:**
+Both the root crontab and systemd timers reference Nextcloud (`nextcloud-backup.sh`, `check-nextcloud.timer`, `php` cron entry in `/etc/cron.d/php`). However, no `nextcloud` or `php-fpm` service appears in the running services list.
+
+**Evidence:**
+```
+# crontab
+0 3 * * 0   /usr/local/bin/nextcloud-backup.sh
+# timers
+check-nextcloud.timer — active, fires every ~30 minutes
+# /etc/cron.d/php — PHP session cleanup job
+```
+
+**Impact:**
+Scripts that reference non-existent services generate cron errors (delivered via local mail or logged to `/var/mail/root`). The `check-nextcloud.timer` firing every 30 minutes against a non-running application generates noise that obscures legitimate monitoring. If the backup script attempts to create snapshots of a non-existent application, it may fail silently and create a false sense of backup coverage.
+
+**Remediation:**
+```bash
+# Verify if Nextcloud is installed but not running, or fully absent
+ls /var/www/html/nextcloud 2>/dev/null || ls /var/www/nextcloud 2>/dev/null
+sudo -u www-data php /var/www/html/nextcloud/occ status 2>/dev/null
+
+# If absent: remove cron entries and disable timer
+sudo systemctl stop check-nextcloud.timer
+sudo systemctl disable check-nextcloud.timer
+# Edit root crontab to remove nextcloud-backup.sh entry
+```
+
+---
+
+## 5. Positive Security Controls
+
+The following controls were confirmed present and correctly configured. These represent genuine security value and should be maintained.
+
+| Control | Detail |
+|---------|--------|
+| **OS fully patched** | 0 pending upgrades on Ubuntu 24.04.4 LTS. `unattended-upgrades` is active. |
+| **WireGuard VPN** | Remote access channeled through WireGuard. Cryptographically sound protocol (Curve25519, ChaCha20-Poly1305). Peers use public key authentication. |
+| **UFW default-deny** | `Default: deny (incoming)` is correctly set. All traffic not explicitly permitted is dropped. |
+| **fail2ban active** | Both `sshd` and `xrdp` jails are running. Provides brute-force protection on the two main access points. |
+| **ClamAV** | `clamav-daemon` and `clamav-freshclam` running. Real-time scanning and auto-updating virus definitions. |
+| **x11vnc localhost-only** | VNC bound to `127.0.0.1` only (`-localhost` flag confirmed). Not externally accessible — correct for the xrdp proxy architecture. |
+| **SSH key-based auth (implied)** | `KbdInteractiveAuthentication no` in sshd_config. Password auth via keyboard-interactive is disabled. PAM handles remaining auth. |
+| **No world-writable SUID binaries** | All identified SUID/SGID binaries are standard system utilities with expected paths. No non-standard SUID binaries found. |
+| **AIDE daily check** | `dailyaidecheck.timer` active — filesystem integrity monitoring running daily. |
+| **rsyslog active** | Centralized logging via rsyslog is running. |
+| **Systemd timers for maintenance** | Safe-update, maintenance, and monitoring tasks are scheduled with market-hours awareness (weekends only for impactful operations). |
+
+---
+
+## 6. Remediation Roadmap
+
+Prioritized by risk and operational impact. All changes on a live trading server should be applied during market close (weekends).
+
+### Phase 1 — Critical (apply immediately, low operational risk)
+
+| Action | Command / File | Risk of applying |
+|--------|---------------|-----------------|
+| Disable `SaveConfig` in wg0.conf | Edit `/etc/wireguard/wg0.conf` | Low — requires wg-quick restart |
+| Disable X11Forwarding | Edit `/etc/ssh/sshd_config` | Very low |
+| Set UFW logging to medium | `sudo ufw logging medium` | None |
+| Remove pkexec SUID | `sudo chmod u-s /usr/bin/pkexec` | Low |
+| Disable CUPS/cups-browsed | `systemctl disable --now cups cups-browsed` | None |
+| Disable Avahi | `systemctl disable --now avahi-daemon` | None |
+
+### Phase 2 — High (apply at next maintenance window)
+
+| Action | Risk of applying |
+|--------|-----------------|
+| Restrict SSH `ListenAddress` to wg0 + LAN | Medium — test carefully before closing session |
+| Clean up UFW ruleset (full reset + rebuild) | Medium — requires planned maintenance window |
+| Verify Apache/Nextcloud status — disable if not needed | Low if no active users |
+| Disable MariaDB if no application backend | Low |
+| Disable Postfix | Low |
+
+### Phase 3 — Medium/Low (next weekend)
+
+| Action | Risk of applying |
+|--------|-----------------|
+| Clean up duplicate crontab entries | Low |
+| Restrict Samba interfaces in smb.conf | Low |
+| Disable Winbind | Low |
+| Document or remove WireGuard peer 10.8.0.3 | None |
+| Disable Nextcloud cron/timer if service absent | None |
+
+---
+
+## 7. Appendix — Raw Enumeration Data
+
+### A. Open Ports (TCP)
+
+| Port | Protocol | Bind address | Service | Notes |
+|------|----------|-------------|---------|-------|
+| 22 | TCP | 0.0.0.0 / :: | OpenSSH | Should be restricted to wg0 + LAN |
+| 25 | TCP | 127.0.0.1 / ::1 | Postfix | Localhost only; no operational need |
+| 80 | TCP | * | Apache2 | External exposure risk |
+| 139 | TCP | 0.0.0.0 / :: | Samba (NetBIOS) | Should be interface-restricted |
+| 443 | TCP | * | Apache2 (TLS) | External exposure risk |
+| 445 | TCP | 0.0.0.0 / :: | Samba (SMB) | Should be interface-restricted |
+| 631 | TCP | 127.0.0.1 / ::1 | CUPS | Unnecessary service |
+| 3306 | TCP | 127.0.0.1 | MariaDB | Localhost only; undocumented purpose |
+| 3350 | TCP | ::1 | xrdp-sesman | Session manager; localhost only |
+| 3389 | TCP | * | xrdp | RDP — should restrict to wg0/LAN |
+| 5900 | TCP | 127.0.0.1 / ::1 | x11vnc (mt5) | Localhost only — correct |
+| 5901 | TCP | 127.0.0.1 / ::1 | x11vnc (secondary) | Localhost only — correct |
+
+### B. WireGuard Peers
+
+| VPN IP | Endpoint | Last handshake | Notes |
+|--------|----------|---------------|-------|
+| 10.8.0.2/32 | 192.168.0.32 (LAN) | 35 seconds ago | Active — primary Windows client |
+| 10.8.0.3/32 | 84.125.103.70 (external) | No handshake shown | Undocumented peer — review required |
+
+### C. Running Services — Security Relevance
+
+| Service | Assessment |
+|---------|-----------|
+| apache2 | HIGH — review or disable |
+| avahi-daemon | MEDIUM — disable |
+| clamav-daemon | POSITIVE — keep |
+| cups / cups-browsed | LOW — disable |
+| fail2ban | POSITIVE — keep |
+| mariadb | HIGH — review or disable |
+| postfix | HIGH — disable if not needed |
+| smbd / nmbd / winbind | MEDIUM — restrict interfaces, disable winbind |
+| ssh | CRITICAL — restrict ListenAddress |
+| xrdp | HIGH — restrict via UFW to wg0 only |
+| x11vnc (localhost) | POSITIVE — correctly bound |
+| wg (WireGuard) | POSITIVE — core access control |
+
+### D. SUID Binaries
+
+All identified SUID binaries are standard Ubuntu system utilities. No non-standard or unexpected SUID binaries were found. `/usr/bin/pkexec` is present (see LOW-02).
+
+```
+/usr/bin/chfn        /usr/bin/umount       /usr/bin/pkexec
+/usr/bin/su          /usr/bin/sudo         /usr/bin/chsh
+/usr/bin/newgrp      /usr/bin/gpasswd      /usr/bin/mount
+/usr/bin/passwd      /usr/bin/fusermount3  /usr/bin/ssh-agent
+/usr/bin/crontab     /usr/bin/chage        /usr/sbin/pppd
+```
+
+### E. Authentication Log Summary
+
+```
+# last (login history — 20 entries)
+All SSH logins from: 10.8.0.2 (WireGuard peer) and 192.168.0.32 (LAN)
+No logins from unexpected sources.
+
+# lastb (failed login attempts)
+0 failed attempts recorded (btmp begins 2026-06-02)
+```
+
+---
+
+*Report generated: 2026-06-12 | shadowserver security self-audit v1.0*
+*Tools used: ss, systemctl, ufw, wg, crontab, find, last, lastb, /etc/ssh/sshd_config*
