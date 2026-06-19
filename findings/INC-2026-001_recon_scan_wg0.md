@@ -4,7 +4,7 @@
 **Detection Date:** 2026-06-18
 **Severity:** Low
 **Status:** Closed — No Action Required
-**Analyst:** sombra_0
+**Analyst:** sombra
 
 ---
 
