@@ -70,6 +70,7 @@ Real security events detected post-audit, documented following a structured inci
 ## Methodology
 
 Manual audit using standard Linux enumeration tools:
+
 **Enumeration**
 - `ss -tlnp` / `ss -ulnp` — port enumeration
 - `systemctl list-units` — service inventory
