@@ -4,7 +4,7 @@
 **Detection Date:** 2026-06-18
 **Severity:** Low
 **Status:** Closed — No Action Required
-**Analyst:** sombra
+**Analyst:** sombra_0
 
 ---
 
@@ -58,22 +58,27 @@ Observed characteristics:
 
 * **T1595.001 — Active Scanning: Scanning IP Blocks**
 
-### Discovery
-
-* **T1046 — Network Service Discovery**
-
 ---
 
 ## Evidence
 
 ### Firewall Logs
 
+First observed event:
 ```
-/var/log/kern.log
+2026-06-21T04:37:13.371195+00:00 shadowserver kernel: [UFW BLOCK] IN=eno1 OUT= MAC=b8:ae:ed:71:64:f7:7c:13:1d:a0:63:d0:08:00 SRC=216.180.246.38 DST=[REDACTED] LEN=44 TOS=0x00 PREC=0x00 TTL=57 ID=16828 PROTO=TCP SPT=21635 DPT=51820 WINDOW=1025 RES=0x00 SYN URGP=0
+```
+Last observed event:
+```
+2026-06-22T08:27:33.885358+00:00 shadowserver kernel: [UFW BLOCK] IN=eno1 OUT= MAC=b8:ae:ed:71:64:f7:7c:13:1d:a0:63:d0:08:00 SRC=216.180.246.216 DST=[REDACTED] LEN=44 TOS=0x00 PREC=0x00 TTL=57 ID=6705 PROTO=TCP SPT=21403 DPT=51820 WINDOW=1025 RES=0x00 SYN URGP=0
+```
+**Attack window:** 2026-06-18 [2026-06-21] — [2026-06-22] UTC
 
-[UFW BLOCK] SRC=216.180.246.x DPT=51820 PROTO=TCP
-[UFW BLOCK] SRC=51.159.125.200 DPT=51820 PROTO=TCP
-```
+**Total blocked events:** 60
+- 216.180.246.233: 16 events
+- 216.180.246.212: 16 events  
+- 216.180.246.211: 16 events
+- 51.159.125.200:  12 events
 
 ### Threat Intelligence
 
